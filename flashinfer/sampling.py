@@ -162,6 +162,8 @@ def get_sampling_module():
         top_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        maybe_seed: Optional[int] = None,
+        maybe_offset: Optional[int] = None,
     ) -> torch.Tensor:
         device = probs.device
         probs = probs.float()
@@ -170,7 +172,10 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        seed, offset = get_seed_and_offset(batch_size * 32, generator)
+        if maybe_seed is not None and maybe_offset is not None:
+            seed, offset = maybe_seed, maybe_offset
+        else:
+            seed, offset = get_seed_and_offset(batch_size * 32, generator)
         module.top_p_sampling_from_probs(
             probs,
             samples,
@@ -191,6 +196,8 @@ def get_sampling_module():
         top_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        maybe_seed: Optional[int] = None,
+        maybe_offset: Optional[int] = None,
     ) -> torch.Tensor:
         sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
         return sample
@@ -280,6 +287,8 @@ def get_sampling_module():
         top_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        maybe_seed: Optional[int] = None,
+        maybe_offset: Optional[int] = None,
     ) -> torch.Tensor:
         device = probs.device
         probs = probs.float()
@@ -289,7 +298,10 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-        seed, offset = get_seed_and_offset(batch_size * 32, generator)
+        if maybe_seed is not None and maybe_offset is not None:
+            seed, offset = maybe_seed, maybe_offset
+        else:
+            seed, offset = get_seed_and_offset(batch_size * 32, generator)
         module.top_k_top_p_sampling_from_probs(
             probs,
             samples,
@@ -314,6 +326,8 @@ def get_sampling_module():
         top_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        maybe_seed: Optional[int] = None,
+        maybe_offset: Optional[int] = None,
     ) -> torch.Tensor:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         sample = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
@@ -688,6 +702,8 @@ def top_p_sampling_from_probs(
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -718,6 +734,12 @@ def top_p_sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
+    seed: Optional[int]
+        Random seed for sampling. When both ``seed`` and ``offset`` are provided,
+        the generator is bypassed, making the function CUDA graph compliant.
+    offset: Optional[int]
+        Random offset for sampling. When both ``seed`` and ``offset`` are provided,
+        the generator is bypassed, making the function CUDA graph compliant.
 
     Returns
     -------
@@ -760,7 +782,8 @@ def top_p_sampling_from_probs(
             raise ValueError("Input probs contains NaN.")
     _check_tensor_param(top_p, probs)
     return get_sampling_module().top_p_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator
+        probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator,
+        seed, offset
     )
 
 
@@ -935,6 +958,8 @@ def top_k_top_p_sampling_from_logits(
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
 
@@ -974,6 +999,12 @@ def top_k_top_p_sampling_from_logits(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
+    seed: Optional[int]
+        Random seed for sampling. When both ``seed`` and ``offset`` are provided,
+        the generator is bypassed, making the function CUDA graph compliant.
+    offset: Optional[int]
+        Random offset for sampling. When both ``seed`` and ``offset`` are provided,
+        the generator is bypassed, making the function CUDA graph compliant.
 
     Returns
     -------
@@ -1030,6 +1061,8 @@ def top_k_top_p_sampling_from_logits(
             deterministic,
             check_nan=check_nan,
             generator=generator,
+            seed=seed,
+            offset=offset,
         )
     elif filter_apply_order == "joint":
         probs = torch.softmax(logits, dim=-1)
@@ -1043,6 +1076,8 @@ def top_k_top_p_sampling_from_logits(
             *_to_tensor_scalar_tuple(top_p),
             deterministic,
             generator,
+            seed,
+            offset,
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
@@ -1057,6 +1092,8 @@ def top_k_top_p_sampling_from_probs(
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
 
@@ -1096,6 +1133,12 @@ def top_k_top_p_sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
+    seed: Optional[int]
+        Random seed for sampling. When both ``seed`` and ``offset`` are provided,
+        the generator is bypassed, making the function CUDA graph compliant.
+    offset: Optional[int]
+        Random offset for sampling. When both ``seed`` and ``offset`` are provided,
+        the generator is bypassed, making the function CUDA graph compliant.
 
     Returns
     -------
@@ -1146,6 +1189,8 @@ def top_k_top_p_sampling_from_probs(
             deterministic,
             check_nan=check_nan,
             generator=generator,
+            seed=seed,
+            offset=offset,
         )
     elif filter_apply_order == "joint":
         if check_nan:
@@ -1158,6 +1203,8 @@ def top_k_top_p_sampling_from_probs(
             *_to_tensor_scalar_tuple(top_p),
             deterministic,
             generator,
+            seed,
+            offset,
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")

@@ -588,6 +588,40 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
+def _gather_sampled_probs(
+    probs: torch.Tensor,
+    samples: torch.Tensor,
+    indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Gather sampled token probabilities from probability matrix."""
+    batch_size = samples.size(0)
+    row_indices = (
+        indices.to(dtype=torch.long, device=probs.device)
+        if indices is not None
+        else torch.arange(batch_size, dtype=torch.long, device=probs.device)
+    )
+    return probs[row_indices, samples.to(dtype=torch.long, device=probs.device)]
+
+
+def _joint_top_k_top_p_renorm_probs(
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    top_p: Union[torch.Tensor, float],
+) -> torch.Tensor:
+    """Renormalize probabilities after joint top-k and top-p filtering."""
+    top_k_probs = top_k_renorm_probs(probs, top_k)
+    top_p_probs = top_p_renorm_probs(probs, top_p)
+    joint_probs = torch.where(
+        (top_k_probs > 0) & (top_p_probs > 0),
+        probs,
+        torch.zeros_like(probs),
+    )
+    normalizer = joint_probs.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(joint_probs.dtype).tiny
+    )
+    return joint_probs / normalizer
+
+
 def _validate_and_convert_seed_offset(
     seed: Union[int, torch.Tensor],
     offset: Union[int, torch.Tensor],
@@ -1211,7 +1245,8 @@ def top_k_top_p_sampling_from_logits(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
-) -> torch.Tensor:
+    return_sampled_probs: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -1269,11 +1304,17 @@ def top_k_top_p_sampling_from_logits(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_sampled_probs: bool
+        Whether to return sampled-token probabilities from the filtered distribution.
+        If ``False``, returns sampled token ids only. If ``True``, returns a tuple
+        ``(samples, sampled_probs)`` where sampled_probs has shape ``(batch_size,)``.
 
     Returns
     -------
-    samples: torch.Tensor
-        Sampled categories, shape ``(batch_size,)``.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_sampled_probs`` is ``False``, returns sampled categories with shape
+        ``(batch_size,)``. If ``True``, returns ``(samples, sampled_probs)`` where
+        ``sampled_probs`` are per-token probabilities from the sampling distribution.
 
     Examples
     --------
@@ -1305,7 +1346,9 @@ def top_k_top_p_sampling_from_logits(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32.
+    This function expects float32 inputs. The sampled token ids use int32 output
+    by default (or indices dtype when indices is provided), and sampled
+    probabilities use float32 when ``return_sampled_probs=True``.
 
     See Also
     --------
@@ -1316,7 +1359,7 @@ def top_k_top_p_sampling_from_logits(
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
-        return top_p_sampling_from_probs(
+        samples = top_p_sampling_from_probs(
             probs,
             top_p,
             indices,
@@ -1326,12 +1369,17 @@ def top_k_top_p_sampling_from_logits(
             seed=seed,
             offset=offset,
         )
+        if not return_sampled_probs:
+            return samples
+        sampling_probs = top_p_renorm_probs(probs, top_p)
+        sampled_probs = _gather_sampled_probs(sampling_probs, samples, indices)
+        return samples, sampled_probs
     elif filter_apply_order == "joint":
         probs = torch.softmax(logits, dim=-1)
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        return get_sampling_module().top_k_top_p_sampling_from_probs(
+        samples = get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             indices,
             *_to_tensor_scalar_tuple(top_k),
@@ -1341,6 +1389,11 @@ def top_k_top_p_sampling_from_logits(
             seed,
             offset,
         )
+        if not return_sampled_probs:
+            return samples
+        sampling_probs = _joint_top_k_top_p_renorm_probs(probs, top_k, top_p)
+        sampled_probs = _gather_sampled_probs(sampling_probs, samples, indices)
+        return samples, sampled_probs
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
@@ -1482,6 +1535,53 @@ def top_k_top_p_sampling_from_probs(
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
+
+
+@flashinfer_api
+def top_k_top_p_renorm_probs(
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    top_p: Union[torch.Tensor, float],
+    filter_apply_order: str = "top_k_first",
+) -> torch.Tensor:
+    r"""Renormalize probabilities after applying top-k and top-p filtering.
+
+    Parameters
+    ----------
+    probs: torch.Tensor
+        Probabilities, shape ``(batch_size, num_classes)``.
+    top_k: Union[torch.Tensor, int]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the
+        threshold for top-k filtering.
+    top_p: Union[torch.Tensor, float]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the
+        threshold for top-p filtering.
+    filter_apply_order: str
+        The order of applying top-k and top-p filtering, should be either
+        ``"top_k_first"`` or ``"joint"``.
+        If ``"top_k_first"``, we first apply top-k renormalization, then apply top-p.
+        If ``"joint"``, we apply top-k and top-p masks jointly and renormalize once.
+
+    Returns
+    -------
+    renorm_probs: torch.Tensor
+        Renormalized probabilities, shape ``(batch_size, num_classes)``.
+
+    See Also
+    --------
+    top_k_top_p_sampling_from_probs
+    top_k_renorm_probs
+    top_p_renorm_probs
+    """
+    if filter_apply_order == "top_k_first":
+        return top_p_renorm_probs(top_k_renorm_probs(probs, top_k), top_p)
+    elif filter_apply_order == "joint":
+        return _joint_top_k_top_p_renorm_probs(probs, top_k, top_p)
+    else:
+        raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
+
+
+top_k_top_p_renorm_prob = top_k_top_p_renorm_probs
 
 
 @flashinfer_api

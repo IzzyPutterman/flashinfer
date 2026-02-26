@@ -422,6 +422,147 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     assert torch.all(samples == samples_ref)
 
 
+@pytest.mark.parametrize("filter_apply_order", ["top_k_first", "joint"])
+def test_top_k_top_p_sampling_from_logits_return_sampled_probs(filter_apply_order):
+    torch.manual_seed(42)
+    batch_size = 19
+    vocab_size = 111
+    top_k = 17
+    top_p = 0.5
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+
+    samples, sampled_probs = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits,
+        top_k,
+        top_p,
+        filter_apply_order=filter_apply_order,
+        return_sampled_probs=True,
+    )
+
+    if filter_apply_order == "top_k_first":
+        masked_logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
+        base_probs = torch.softmax(masked_logits, dim=-1)
+        sampling_probs = flashinfer.sampling.top_p_renorm_probs(base_probs, top_p)
+    else:
+        base_probs = torch.softmax(logits, dim=-1)
+        top_k_probs = flashinfer.sampling.top_k_renorm_probs(base_probs, top_k)
+        top_p_probs = flashinfer.sampling.top_p_renorm_probs(base_probs, top_p)
+        sampling_probs = torch.where(
+            (top_k_probs > 0) & (top_p_probs > 0),
+            base_probs,
+            torch.zeros_like(base_probs),
+        )
+        sampling_probs = sampling_probs / sampling_probs.sum(dim=-1, keepdim=True)
+
+    sampled_probs_ref = sampling_probs[
+        torch.arange(batch_size, device=logits.device), samples.long()
+    ]
+    torch.testing.assert_close(sampled_probs, sampled_probs_ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("filter_apply_order", ["top_k_first", "joint"])
+def test_top_k_top_p_sampling_from_logits_return_sampled_probs_with_indices(
+    filter_apply_order,
+):
+    torch.manual_seed(42)
+    unique_batch_size = 11
+    batch_size = 29
+    vocab_size = 257
+    top_k = 37
+    top_p = 0.8
+
+    logits = torch.randn(unique_batch_size, vocab_size, device="cuda:0") * 5
+    indices = torch.randint(
+        0,
+        unique_batch_size,
+        (batch_size,),
+        dtype=torch.int64,
+        device=logits.device,
+    )
+
+    samples, sampled_probs = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits,
+        top_k,
+        top_p,
+        indices=indices,
+        filter_apply_order=filter_apply_order,
+        return_sampled_probs=True,
+    )
+
+    if filter_apply_order == "top_k_first":
+        masked_logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
+        base_probs = torch.softmax(masked_logits, dim=-1)
+        sampling_probs = flashinfer.sampling.top_p_renorm_probs(base_probs, top_p)
+    else:
+        base_probs = torch.softmax(logits, dim=-1)
+        top_k_probs = flashinfer.sampling.top_k_renorm_probs(base_probs, top_k)
+        top_p_probs = flashinfer.sampling.top_p_renorm_probs(base_probs, top_p)
+        sampling_probs = torch.where(
+            (top_k_probs > 0) & (top_p_probs > 0),
+            base_probs,
+            torch.zeros_like(base_probs),
+        )
+        sampling_probs = sampling_probs / sampling_probs.sum(dim=-1, keepdim=True)
+
+    sampled_probs_ref = sampling_probs[indices.long(), samples.long()]
+    torch.testing.assert_close(sampled_probs, sampled_probs_ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("vocab_size", [111, 4096])
+@pytest.mark.parametrize("k", [10, 100])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_top_k_top_p_renorm_probs_top_k_first(batch_size, vocab_size, k, p):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    renorm_probs = flashinfer.sampling.top_k_top_p_renorm_probs(
+        probs, k, p, filter_apply_order="top_k_first"
+    )
+    renorm_probs_ref = flashinfer.sampling.top_p_renorm_probs(
+        flashinfer.sampling.top_k_renorm_probs(probs, k), p
+    )
+
+    torch.testing.assert_close(renorm_probs, renorm_probs_ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("vocab_size", [111, 4096])
+@pytest.mark.parametrize("k", [10, 100])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_top_k_top_p_renorm_probs_joint(batch_size, vocab_size, k, p):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    eps = 1e-4
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    sorted_prob_asc, sorted_indices_asc = torch.sort(probs, descending=False)
+    cdf = torch.cumsum(sorted_prob_asc, dim=-1)
+    mask_top_p = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=probs.device)
+    mask_top_p.scatter_add_(1, sorted_indices_asc, (cdf > (1 - p) - eps).int())
+
+    sorted_prob_desc, _ = torch.sort(probs, descending=True)
+    pivot = sorted_prob_desc[:, k - 1]
+    mask_top_k = (probs >= pivot.unsqueeze(-1)).int()
+
+    mask_joint = torch.minimum(mask_top_k, mask_top_p).bool()
+    renorm_probs_ref = torch.where(mask_joint, probs, torch.zeros_like(probs))
+    renorm_probs_ref = renorm_probs_ref / renorm_probs_ref.sum(dim=-1, keepdim=True)
+
+    renorm_probs = flashinfer.sampling.top_k_top_p_renorm_probs(
+        probs, k, p, filter_apply_order="joint"
+    )
+
+    torch.testing.assert_close(renorm_probs, renorm_probs_ref, rtol=1e-5, atol=1e-6)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 1.0])
